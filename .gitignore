@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.bak
+*.log
+.env
+config/
+*.img
+*.zip
+*.tgz
+*.tar.gz
