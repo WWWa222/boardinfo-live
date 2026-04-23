@@ -194,6 +194,8 @@ def net_stats() -> list[dict[str, str]]:
             continue
         rows.append({
             "if": iface.name,
+            "kind": iface_kind(iface),
+            "ip": iface_ip(iface.name),
             "state": read_text(iface / "operstate", "unknown"),
             "rx_mb": bytes_to_mb(read_text(iface / "statistics" / "rx_bytes")),
             "tx_mb": bytes_to_mb(read_text(iface / "statistics" / "tx_bytes")),
@@ -201,11 +203,43 @@ def net_stats() -> list[dict[str, str]]:
     return rows
 
 
+def iface_kind(iface: Path) -> str:
+    if (iface / "wireless").exists() or iface.name.startswith(("wl", "wlan")):
+        return "wifi"
+    if iface.name.startswith(("en", "eth")):
+        return "wire"
+    return "net"
+
+
+def iface_ip(name: str) -> str:
+    out = run(["ip", "-o", "-4", "addr", "show", "dev", name, "scope", "global"])
+    for line in out.splitlines():
+        parts = line.split()
+        if "inet" in parts:
+            idx = parts.index("inet")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    return "-"
+
+
 def bytes_to_mb(raw: str) -> str:
     try:
         return f"{int(raw) / (1024 ** 2):.1f}"
     except ValueError:
         return "NA"
+
+
+def usb_devices() -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for dev in sorted(Path("/sys/bus/usb/devices").glob("[0-9]*-*"), key=lambda p: p.name):
+        vendor = read_text(dev / "idVendor")
+        product = read_text(dev / "idProduct")
+        if not vendor or not product:
+            continue
+        busnum = read_text(dev / "busnum", "-")
+        devnum = read_text(dev / "devnum", dev.name)
+        rows.append({"bus": busnum, "dev": devnum, "id": f"{vendor}:{product}", "name": dev.name})
+    return rows
 
 
 def top_processes(limit: int = 8) -> list[dict[str, str]]:
@@ -269,6 +303,7 @@ def collect() -> dict[str, object]:
         "block": block_devices(),
         "filesystems": filesystems(),
         "network": {"addresses": net_addrs(), "stats": net_stats()},
+        "usb": usb_devices(),
         "regulators": regulators(),
         "top": top_processes(),
     }
@@ -318,7 +353,14 @@ def main() -> int:
     for row in data["network"]["addresses"]:
         print(f"{row['if']:<10} {row['family']:<5} {row['addr']}")
     for row in data["network"]["stats"]:
-        print(f"{row['if']:<10} {row['state']:<8} rx={row['rx_mb']}MiB tx={row['tx_mb']}MiB")
+        print(f"{row['if']:<10} {row['kind']:<5} {row['state']:<8} ip={row['ip']:<18} rx={row['rx_mb']}MiB tx={row['tx_mb']}MiB")
+
+    print_section("USB Stage")
+    if data["usb"]:
+        for row in data["usb"]:
+            print(f"Bus {row['bus']:<3} Dev {row['dev']:<3} ID {row['id']:<9} {row['name']}")
+    else:
+        print("No USB devices detected")
 
     if data["regulators"]:
         print_section("Regulators")
@@ -343,7 +385,9 @@ from __future__ import annotations
 import argparse
 import curses
 import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 from collections import deque
@@ -361,6 +405,13 @@ def read_text(path: str | Path, default: str = "") -> str:
         return Path(path).read_text(encoding="utf-8", errors="ignore").strip()
     except OSError:
         return default
+
+
+def run(command: list[str], timeout: float = 2.0) -> str:
+    try:
+        return subprocess.check_output(command, text=True, stderr=subprocess.DEVNULL, timeout=timeout).strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def cpu_times() -> tuple[int, int]:
@@ -399,6 +450,56 @@ def disk_usage(path: str = "/") -> tuple[float | None, str]:
     if not usage.total:
         return None, "NA"
     return 100.0 * usage.used / usage.total, f"{usage.used / 1024 ** 3:.2f}/{usage.total / 1024 ** 3:.2f} GiB"
+
+
+def iface_kind(iface: Path) -> str:
+    if (iface / "wireless").exists() or iface.name.startswith(("wl", "wlan")):
+        return "wifi"
+    if iface.name.startswith(("en", "eth")):
+        return "wire"
+    return "net"
+
+
+def iface_ip(name: str) -> str:
+    out = run(["ip", "-o", "-4", "addr", "show", "dev", name, "scope", "global"])
+    for line in out.splitlines():
+        parts = line.split()
+        if "inet" in parts:
+            idx = parts.index("inet")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    return "-"
+
+
+def net_counters() -> dict[str, tuple[int, int, str, str, str]]:
+    counters: dict[str, tuple[int, int, str, str, str]] = {}
+    for iface in sorted(Path("/sys/class/net").iterdir(), key=lambda p: p.name):
+        if iface.name == "lo":
+            continue
+        try:
+            rx = int(read_text(iface / "statistics" / "rx_bytes", "0"))
+            tx = int(read_text(iface / "statistics" / "tx_bytes", "0"))
+        except ValueError:
+            continue
+        counters[iface.name] = (
+            rx,
+            tx,
+            read_text(iface / "operstate", "unknown"),
+            iface_kind(iface),
+            iface_ip(iface.name),
+        )
+    return counters
+
+
+def usb_devices() -> list[str]:
+    devices: list[str] = []
+    for dev in sorted(Path("/sys/bus/usb/devices").glob("[0-9]*-*"), key=lambda p: p.name):
+        vendor = read_text(dev / "idVendor")
+        product = read_text(dev / "idProduct")
+        if not vendor or not product:
+            continue
+        devices.append(f"{vendor}:{product} {dev.name}")
+    return devices
 
 
 def thermal() -> list[tuple[str, str, float | None]]:
@@ -443,12 +544,20 @@ def color_pair_for(key: str, value: float | None = None) -> int:
         if value >= 70:
             return YELLOW_PAIR
         return GREEN_PAIR
+    if key == "usb:devices":
+        return GREEN_PAIR if value and value > 0 else YELLOW_PAIR
     return WHITE_PAIR
 
 
 def axis_range(key: str, values: list[float]) -> tuple[float, float]:
     if key in ("cpu", "memory", "disk:/"):
         return 0.0, 100.0
+    if key.startswith("net:"):
+        hi = max(values) if values else 1.0
+        return 0.0, max(1.0, hi * 1.2)
+    if key == "usb:devices":
+        hi = max(values) if values else 1.0
+        return 0.0, max(1.0, hi)
     if key.startswith("temp:"):
         return 20.0, 90.0
     if not values:
@@ -516,27 +625,63 @@ def fmt_temp(value: float | None) -> str:
 
 
 def value_text(key: str, value: float | None) -> str:
-        if key.startswith("temp:"):
-            return fmt_temp(value)
-        return fmt_pct(value)
+    if key.startswith("temp:"):
+        return fmt_temp(value)
+    if key.startswith("net:"):
+        return "NA" if value is None else f"{value:7.1f} KiB/s"
+    if key == "usb:devices":
+        return "NA" if value is None else f"{int(value)} dev"
+    return fmt_pct(value)
 
 
-def collect_points(prev_cpu: tuple[int, int], labels: dict[str, str]) -> tuple[list[tuple[str, float | None]], tuple[int, int]]:
+def collect_points(
+    prev_cpu: tuple[int, int],
+    prev_net: dict[str, tuple[int, int, str, str, str]],
+    elapsed: float,
+    labels: dict[str, str],
+) -> tuple[list[tuple[str, float | None]], tuple[int, int], dict[str, tuple[int, int, str, str, str]]]:
     cpu, next_cpu = cpu_usage(prev_cpu)
     mem, mem_label = mem_usage()
     disk, disk_label = disk_usage("/")
     labels["memory"] = f"memory {mem_label}"
     labels["disk:/"] = f"disk / {disk_label}"
-    points: list[tuple[str, float | None]] = [("cpu", cpu), ("memory", mem), ("disk:/", disk)]
+    points: list[tuple[str, float | None]] = [("cpu", cpu), ("memory", mem)]
+
+    next_net = net_counters()
+    elapsed = max(elapsed, 0.001)
+    for name, (rx, tx, state, kind, ip_addr) in next_net.items():
+        prev = prev_net.get(name)
+        rx_rate: float | None = None
+        tx_rate: float | None = None
+        if prev:
+            rx_rate = max(0, rx - prev[0]) / elapsed / 1024.0
+            tx_rate = max(0, tx - prev[1]) / elapsed / 1024.0
+        labels[f"net:{name}:rx"] = f"{kind} {name} RX {ip_addr} {state}"
+        labels[f"net:{name}:tx"] = f"{kind} {name} TX {ip_addr} {state}"
+        points.append((f"net:{name}:rx", rx_rate))
+        points.append((f"net:{name}:tx", tx_rate))
+
+    points.append(("disk:/", disk))
+    usb = usb_devices()
+    labels["usb:devices"] = "USB stage " + (" | ".join(usb[:3]) if usb else "no devices")
+    points.append(("usb:devices", float(len(usb))))
+
     for zone, ztype, temp in thermal():
         key = f"temp:{zone}"
         labels[key] = f"temp {zone} {ztype}"
         points.append((key, temp))
-    return points, next_cpu
+    return points, next_cpu, next_net
+
+
+def summary_line(labels: dict[str, str], prefix: str) -> str:
+    parts = [label for key, label in labels.items() if key.startswith(prefix)]
+    return " | ".join(parts) if parts else "none"
 
 
 def draw_text_once(items: list[str], history: dict[str, deque[float | None]], labels: dict[str, str]) -> None:
     print(f"{time.strftime('%F %T')} host={os.uname().nodename} load={loadavg()} freq={cpu_freq_summary()}")
+    print(f"Network: {summary_line(labels, 'net:')}")
+    print(f"USB Stage: {labels.get('usb:devices', 'none')}")
     print(f"{'ITEM':<26} {'NOW':>12} {'STATUS':>8}")
     for idx, key in enumerate(items):
         value = history[key][-1] if history.get(key) else None
@@ -554,16 +699,17 @@ def draw_dashboard(stdscr: curses.window, items: list[str], selected: int, histo
     stdscr.addnstr(0, 0, f"{time.strftime('%F %T')}  host={os.uname().nodename}", cols - 1, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
     stdscr.addnstr(1, 0, f"load={loadavg()}  freq={cpu_freq_summary()}", cols - 1, curses.color_pair(WHITE_PAIR))
     stdscr.addnstr(2, 0, "q quit | Up/Down choose item | right panel shows selected waveform", cols - 1, curses.color_pair(WHITE_PAIR))
+    stdscr.addnstr(3, 0, f"network: {summary_line(labels, 'net:')}  usb: {labels.get('usb:devices', 'none')}", cols - 1, curses.color_pair(WHITE_PAIR))
 
     if rows < 12 or cols < 70:
-        stdscr.addnstr(4, 0, "terminal too small; enlarge it for waveform view", cols - 1, curses.color_pair(YELLOW_PAIR))
+        stdscr.addnstr(5, 0, "terminal too small; enlarge it for waveform view", cols - 1, curses.color_pair(YELLOW_PAIR))
         stdscr.refresh()
         return
 
-    stdscr.addnstr(4, 0, f"{'ITEM':<26} {'NOW':>12}", left_w - 1, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
-    visible_h = rows - 6
+    stdscr.addnstr(5, 0, f"{'ITEM':<26} {'NOW':>12}", left_w - 1, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
+    visible_h = rows - 7
     start = max(0, min(selected - visible_h // 2, max(len(items) - visible_h, 0)))
-    for screen_row, idx in enumerate(range(start, min(start + visible_h, len(items))), start=5):
+    for screen_row, idx in enumerate(range(start, min(start + visible_h, len(items))), start=6):
         key = items[idx]
         value = history[key][-1] if history.get(key) else None
         label_pair = WHITE_PAIR if idx % 2 == 0 else GREEN_PAIR
@@ -575,12 +721,12 @@ def draw_dashboard(stdscr: curses.window, items: list[str], selected: int, histo
         stdscr.addnstr(screen_row, 0, f"{marker} {labels.get(key, key):<25.25}", 28, attr)
         stdscr.addnstr(screen_row, 29, f"{value_text(key, value):>12}", 12, curses.color_pair(value_pair) | (curses.A_REVERSE if idx == selected else 0))
 
-    for y in range(4, rows):
+    for y in range(5, rows):
         stdscr.addch(y, left_w, curses.ACS_VLINE, curses.color_pair(WHITE_PAIR))
 
     selected_key = items[selected]
     selected_value = history[selected_key][-1] if history.get(selected_key) else None
-    wave_h = max(6, rows - 10)
+    wave_h = max(6, rows - 11)
     wave_w = max(12, right_w - 15)
     wave, scale = area_chart(selected_key, history[selected_key], wave_w, wave_h)
     pair = color_pair_for(selected_key, selected_value)
@@ -591,21 +737,21 @@ def draw_dashboard(stdscr: curses.window, items: list[str], selected: int, histo
         f"avg={value_text(selected_key, avg_value)}  "
         f"max={value_text(selected_key, max_value)}"
     )
-    stdscr.addnstr(4, right_x, title, right_w, curses.color_pair(pair) | curses.A_BOLD)
+    stdscr.addnstr(5, right_x, title, right_w, curses.color_pair(pair) | curses.A_BOLD)
     warn, crit = chart_thresholds(selected_key)
     threshold_text = ""
     if warn is not None and crit is not None:
         threshold_text = f" range={scale}  '-' warn {warn:.0f}  '=' critical {crit:.0f}"
     else:
         threshold_text = f" range={scale}"
-    stdscr.addnstr(5, right_x, "older".ljust(max(0, wave_w - 3)) + "now" + threshold_text, right_w, curses.color_pair(WHITE_PAIR))
+    stdscr.addnstr(6, right_x, "older".ljust(max(0, wave_w - 3)) + "now" + threshold_text, right_w, curses.color_pair(WHITE_PAIR))
 
     vals = [v for v in history[selected_key] if v is not None]
     lo, hi = axis_range(selected_key, vals)
     mid = lo + (hi - lo) / 2.0
     ylabels = {0: hi, wave_h // 2: mid, wave_h - 1: lo}
     for i, line in enumerate(wave):
-        y = 6 + i
+        y = 7 + i
         if y >= rows:
             break
         ylab = f"{ylabels[i]:>7.1f} " if i in ylabels else " " * 8
@@ -617,8 +763,12 @@ def draw_dashboard(stdscr: curses.window, items: list[str], selected: int, histo
 def run_curses(args: argparse.Namespace) -> int:
     labels: dict[str, str] = {"cpu": "cpu usage", "memory": "memory used", "disk:/": "disk / used"}
     prev_cpu = cpu_times()
+    prev_net = net_counters()
+    last_sample = time.time()
     time.sleep(min(args.interval, 0.25))
-    points, prev_cpu = collect_points(prev_cpu, labels)
+    now = time.time()
+    points, prev_cpu, prev_net = collect_points(prev_cpu, prev_net, now - last_sample, labels)
+    last_sample = now
     items = [key for key, _ in points]
     history: dict[str, deque[float | None]] = {key: deque(maxlen=args.history) for key in items}
     for key, value in points:
@@ -631,7 +781,7 @@ def run_curses(args: argparse.Namespace) -> int:
     selected = 0
 
     def loop(stdscr: curses.window) -> None:
-        nonlocal selected, prev_cpu, items, history
+        nonlocal selected, prev_cpu, prev_net, last_sample, items, history
         curses.curs_set(0)
         curses.use_default_colors()
         curses.init_pair(WHITE_PAIR, curses.COLOR_WHITE, -1)
@@ -645,7 +795,8 @@ def run_curses(args: argparse.Namespace) -> int:
         while True:
             now = time.time()
             if now >= next_update:
-                points, prev_cpu = collect_points(prev_cpu, labels)
+                points, prev_cpu, prev_net = collect_points(prev_cpu, prev_net, now - last_sample, labels)
+                last_sample = now
                 new_items = [key for key, _ in points]
                 for key in new_items:
                     history.setdefault(key, deque(maxlen=args.history))
