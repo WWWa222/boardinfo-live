@@ -30,6 +30,7 @@ boards with minor differences in device names.
 - CPU usage, load average, current frequency, and governor
 - Memory and swap usage
 - Thermal zones from `/sys/class/thermal`
+- Fan speed from `/sys/class/hwmon` `pwmfan`, using RPM when exposed and PWM duty as fallback
 - Block storage and filesystem usage
 - Network interface state, wifi/wire type, IPv4 address, RX/TX counters
 - Live network RX/TX throughput in `KiB/s`
@@ -41,7 +42,7 @@ boards with minor differences in device names.
 The live dashboard order is:
 
 ```text
-CPU -> memory -> network RX/TX -> disk -> USB stage -> thermal zones
+CPU -> memory -> network RX/TX -> disk -> USB stage -> fan speed -> thermal zones
 ```
 
 ## Install
@@ -120,6 +121,14 @@ Network rows classify interfaces as:
 
 IPv4 addresses are shown when available. Interfaces without an address show
 `-`.
+
+## Fan Notes
+
+The board fan is read from the `pwmfan` hwmon device when present.
+
+- If the kernel exposes `fan1_input`, the tools show real RPM.
+- If no tach/RPM input is exposed, the tools show PWM duty percentage as the
+  fan-speed proxy.
 
 ## Repository Notes
 
