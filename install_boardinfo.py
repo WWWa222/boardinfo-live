@@ -140,6 +140,27 @@ def thermal_zones() -> list[dict[str, str]]:
     return rows
 
 
+def fan_status() -> dict[str, str] | None:
+    for hwmon in sorted(Path("/sys/class/hwmon").glob("hwmon*"), key=lambda p: p.name):
+        if read_text(hwmon / "name") != "pwmfan":
+            continue
+        pwm_raw = read_text(hwmon / "pwm1", "NA")
+        pwm_enable = read_text(hwmon / "pwm1_enable", "NA")
+        rpm = read_text(hwmon / "fan1_input", "")
+        try:
+            pwm_pct = f"{(int(pwm_raw) / 255.0) * 100.0:.1f}"
+        except ValueError:
+            pwm_pct = "NA"
+        return {
+            "name": "pwmfan",
+            "pwm_raw": pwm_raw,
+            "pwm_pct": pwm_pct,
+            "enable": pwm_enable,
+            "rpm": rpm or "NA",
+        }
+    return None
+
+
 def block_devices() -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for device in sorted(Path("/sys/block").iterdir(), key=lambda p: p.name):
@@ -299,6 +320,7 @@ def collect() -> dict[str, object]:
             "swap_total": fmt_kib(swap_total),
             "swap_used": fmt_kib(swap_total - swap_free),
         },
+        "fan": fan_status(),
         "thermal": thermal_zones(),
         "block": block_devices(),
         "filesystems": filesystems(),
@@ -334,6 +356,17 @@ def main() -> int:
     print_section("Memory")
     print(f"Total: {mem['total']}  Available: {mem['available']}  Used: {mem['used_percent']}%")
     print(f"Swap : {mem['swap_used']} / {mem['swap_total']}")
+
+    print_section("Fan")
+    fan = data["fan"]
+    if fan:
+        speed = f"{fan['rpm']} RPM" if fan["rpm"] != "NA" else f"{fan['pwm_pct']}% PWM"
+        print(
+            f"Device: {fan['name']}  Speed: {speed}  "
+            f"PWM raw: {fan['pwm_raw']}  Enable: {fan['enable']}"
+        )
+    else:
+        print("No pwmfan hwmon device detected")
 
     print_section("Thermal")
     print(f"{'ZONE':<4} {'TYPE':<22} {'TEMP(C)':>10}")
@@ -513,6 +546,32 @@ def thermal() -> list[tuple[str, str, float | None]]:
     return rows
 
 
+def fan_status() -> dict[str, object] | None:
+    for hwmon in sorted(Path("/sys/class/hwmon").glob("hwmon*"), key=lambda p: p.name):
+        if read_text(hwmon / "name") != "pwmfan":
+            continue
+        pwm_raw = read_text(hwmon / "pwm1", "NA")
+        pwm_enable = read_text(hwmon / "pwm1_enable", "NA")
+        rpm = read_text(hwmon / "fan1_input", "")
+        try:
+            pwm_pct = (int(pwm_raw) / 255.0) * 100.0
+        except ValueError:
+            pwm_pct = None
+        try:
+            rpm_value = float(rpm)
+        except ValueError:
+            rpm_value = None
+        return {
+            "pwm_raw": pwm_raw,
+            "enable": pwm_enable,
+            "rpm": rpm or "NA",
+            "mode": "rpm" if rpm_value is not None else "pwm",
+            "label_value": rpm if rpm_value is not None else ("NA" if pwm_pct is None else f"{pwm_pct:.1f}%"),
+            "chart_value": rpm_value if rpm_value is not None else pwm_pct,
+        }
+    return None
+
+
 def loadavg() -> str:
     parts = read_text("/proc/loadavg").split()
     return " ".join(parts[:3])
@@ -538,6 +597,12 @@ def color_pair_for(key: str, value: float | None = None) -> int:
         if value >= 65:
             return YELLOW_PAIR
         return GREEN_PAIR
+    if key == "fan:speed":
+        if value >= 70:
+            return GREEN_PAIR
+        if value >= 30:
+            return YELLOW_PAIR
+        return WHITE_PAIR
     if key in ("cpu", "memory", "disk:/"):
         if value >= 85:
             return RED_PAIR
@@ -552,6 +617,9 @@ def color_pair_for(key: str, value: float | None = None) -> int:
 def axis_range(key: str, values: list[float]) -> tuple[float, float]:
     if key in ("cpu", "memory", "disk:/"):
         return 0.0, 100.0
+    if key == "fan:speed":
+        hi = max(values) if values else 100.0
+        return 0.0, max(100.0, hi * 1.1)
     if key.startswith("net:"):
         hi = max(values) if values else 1.0
         return 0.0, max(1.0, hi * 1.2)
@@ -627,6 +695,8 @@ def fmt_temp(value: float | None) -> str:
 def value_text(key: str, value: float | None) -> str:
     if key.startswith("temp:"):
         return fmt_temp(value)
+    if key == "fan:speed":
+        return "NA" if value is None else f"{value:7.1f}"
     if key.startswith("net:"):
         return "NA" if value is None else f"{value:7.1f} KiB/s"
     if key == "usb:devices":
@@ -665,6 +735,11 @@ def collect_points(
     usb = usb_devices()
     labels["usb:devices"] = "USB stage " + (" | ".join(usb[:3]) if usb else "no devices")
     points.append(("usb:devices", float(len(usb))))
+
+    fan = fan_status()
+    if fan:
+        labels["fan:speed"] = f"fan {fan['mode']} {fan['label_value']} enable={fan['enable']} raw={fan['pwm_raw']}"
+        points.append(("fan:speed", fan["chart_value"]))
 
     for zone, ztype, temp in thermal():
         key = f"temp:{zone}"
