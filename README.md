@@ -37,6 +37,7 @@ boards with minor differences in device names.
 - USB stage device list from `/sys/bus/usb/devices`
 - Regulator state and voltage snapshot
 - Top process snapshot
+- Task dashboard with per-core CPU load and per-process detail
 - Fixed-scale live charts with warning and critical thresholds
 
 The live dashboard order is:
@@ -44,6 +45,9 @@ The live dashboard order is:
 ```text
 CPU -> memory -> network RX/TX -> disk -> USB stage -> fan speed -> thermal zones
 ```
+
+The task dashboard is available with `--task-view` and can be toggled at
+runtime with `t`.
 
 ## Install
 
@@ -94,8 +98,14 @@ boardinfo-live
 
 - `Up` / `Down`: select telemetry item
 - `q`: quit
-- Left panel: current values
-- Right panel: selected item's waveform
+- `t`: toggle between overview and task views
+- Overview view: left panel is the item list, right panel shows detail and charts
+
+Task view adds:
+
+- top CPU-consuming process list
+- per-core CPU usage bars
+- selected process PID, PPID, core, priority, nice value, status, and command
 
 ## USB Notes
 

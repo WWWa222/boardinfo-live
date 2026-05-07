@@ -464,6 +464,35 @@ def cpu_usage(prev: tuple[int, int] | None) -> tuple[float | None, tuple[int, in
     return 100.0 * (1.0 - (idle_delta / total_delta)), now
 
 
+def cpu_core_times() -> dict[str, tuple[int, int]]:
+    rows: dict[str, tuple[int, int]] = {}
+    for line in read_text("/proc/stat").splitlines():
+        if not line.startswith("cpu") or not line[3:4].isdigit():
+            continue
+        name, *parts = line.split()
+        vals = [int(v) for v in parts]
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        rows[name] = (sum(vals), idle)
+    return rows
+
+
+def cpu_core_usage(prev: dict[str, tuple[int, int]] | None) -> tuple[list[dict[str, object]], dict[str, tuple[int, int]]]:
+    now = cpu_core_times()
+    rows: list[dict[str, object]] = []
+    prev = prev or {}
+    for name in sorted(now, key=lambda item: int(item[3:])):
+        total, idle = now[name]
+        last = prev.get(name)
+        usage: float | None = None
+        if last is not None:
+            total_delta = total - last[0]
+            idle_delta = idle - last[1]
+            if total_delta > 0:
+                usage = 100.0 * (1.0 - (idle_delta / total_delta))
+        rows.append({"name": name, "usage": usage})
+    return rows, now
+
+
 def mem_usage() -> tuple[float | None, str]:
     values: dict[str, int] = {}
     for line in read_text("/proc/meminfo").splitlines():
@@ -570,6 +599,50 @@ def fan_status() -> dict[str, object] | None:
             "chart_value": rpm_value if rpm_value is not None else pwm_pct,
         }
     return None
+
+
+def task_rows(limit: int = 12) -> list[dict[str, str]]:
+    out = run(["ps", "-eo", "pid,ppid,psr,%cpu,%mem,rss,stat,etimes,comm,args", "--sort=-%cpu"])
+    rows: list[dict[str, str]] = []
+    for line in out.splitlines()[1 : limit + 1]:
+        parts = line.split(None, 9)
+        if len(parts) == 10:
+            rows.append({
+                "pid": parts[0],
+                "ppid": parts[1],
+                "psr": parts[2],
+                "cpu": parts[3],
+                "mem": parts[4],
+                "rss": parts[5],
+                "stat": parts[6],
+                "etime": parts[7],
+                "comm": parts[8],
+                "args": parts[9],
+            })
+    return rows
+
+
+def task_detail(pid: str) -> dict[str, str]:
+    out = run(["ps", "-p", pid, "-o", "pid=,ppid=,psr=,ni=,pri=,pcpu=,pmem=,rss=,stat=,etimes=,comm=,args="])
+    if not out:
+        return {}
+    parts = out.split(None, 11)
+    if len(parts) < 12:
+        return {}
+    return {
+        "pid": parts[0],
+        "ppid": parts[1],
+        "psr": parts[2],
+        "ni": parts[3],
+        "pri": parts[4],
+        "cpu": parts[5],
+        "mem": parts[6],
+        "rss": parts[7],
+        "stat": parts[8],
+        "etime": parts[9],
+        "comm": parts[10],
+        "args": parts[11],
+    }
 
 
 def loadavg() -> str:
@@ -753,10 +826,66 @@ def summary_line(labels: dict[str, str], prefix: str) -> str:
     return " | ".join(parts) if parts else "none"
 
 
-def draw_text_once(items: list[str], history: dict[str, deque[float | None]], labels: dict[str, str]) -> None:
+def clip(text: object, width: int) -> str:
+    raw = str(text)
+    if width <= 0:
+        return ""
+    if len(raw) <= width:
+        return raw
+    if width <= 3:
+        return raw[:width]
+    return raw[: width - 3] + "..."
+
+
+def draw_box(stdscr: curses.window, y: int, x: int, h: int, w: int, title: str, pair: int = WHITE_PAIR) -> None:
+    if h < 2 or w < 2:
+        return
+    attr = curses.color_pair(pair)
+    stdscr.addch(y, x, curses.ACS_ULCORNER, attr)
+    stdscr.addch(y, x + w - 1, curses.ACS_URCORNER, attr)
+    stdscr.addch(y + h - 1, x, curses.ACS_LLCORNER, attr)
+    stdscr.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER, attr)
+    for col in range(x + 1, x + w - 1):
+        stdscr.addch(y, col, curses.ACS_HLINE, attr)
+        stdscr.addch(y + h - 1, col, curses.ACS_HLINE, attr)
+    for row in range(y + 1, y + h - 1):
+        stdscr.addch(row, x, curses.ACS_VLINE, attr)
+        stdscr.addch(row, x + w - 1, curses.ACS_VLINE, attr)
+    if title:
+        stdscr.addnstr(y, x + 2, f" {title} ", max(0, w - 4), attr | curses.A_BOLD)
+
+
+def draw_tabs(stdscr: curses.window, view: str, cols: int) -> None:
+    tabs = [("overview", "Overview"), ("tasks", "Tasks")]
+    x = 2
+    for key, label in tabs:
+        active = key == view
+        text = f" {label} "
+        attr = curses.color_pair(GREEN_PAIR if active else WHITE_PAIR)
+        if active:
+            attr |= curses.A_BOLD | curses.A_REVERSE
+        stdscr.addnstr(3, x, text, max(0, cols - x - 1), attr)
+        x += len(text) + 1
+
+
+def draw_status_line(stdscr: curses.window, view: str, labels: dict[str, str], cols: int) -> None:
+    cpu_line = cpu_freq_summary()
+    fan_line = labels.get("fan:speed", "fan none")
+    usb_line = labels.get("usb:devices", "none")
+    net_line = summary_line(labels, "net:")
+    status = f"{time.strftime('%F %T')}  host={os.uname().nodename}  load={loadavg()}  freq={cpu_line}"
+    stdscr.addnstr(0, 0, clip(status, cols - 1), cols - 1, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
+    meta = f"{fan_line}  |  usb {usb_line}  |  net {net_line}"
+    stdscr.addnstr(1, 0, clip(meta, cols - 1), cols - 1, curses.color_pair(WHITE_PAIR))
+    stdscr.addnstr(2, 0, "q quit | t toggle view | Up/Down move | Enter details", cols - 1, curses.color_pair(WHITE_PAIR))
+    draw_tabs(stdscr, view, cols)
+
+
+def draw_overview_once(items: list[str], history: dict[str, deque[float | None]], labels: dict[str, str]) -> None:
     print(f"{time.strftime('%F %T')} host={os.uname().nodename} load={loadavg()} freq={cpu_freq_summary()}")
     print(f"Network: {summary_line(labels, 'net:')}")
     print(f"USB Stage: {labels.get('usb:devices', 'none')}")
+    print(f"Fan: {labels.get('fan:speed', 'none')}")
     print(f"{'ITEM':<26} {'NOW':>12} {'STATUS':>8}")
     for idx, key in enumerate(items):
         value = history[key][-1] if history.get(key) else None
@@ -764,74 +893,168 @@ def draw_text_once(items: list[str], history: dict[str, deque[float | None]], la
         print(f"{labels.get(key, key):<26.26} {value_text(key, value):>12} {status:>8}")
 
 
-def draw_dashboard(stdscr: curses.window, items: list[str], selected: int, history: dict[str, deque[float | None]], labels: dict[str, str]) -> None:
+def draw_task_once(tasks: list[dict[str, str]], cores: list[dict[str, object]], labels: dict[str, str]) -> None:
+    print(f"{time.strftime('%F %T')} host={os.uname().nodename} view=tasks load={loadavg()}")
+    core_text: list[str] = []
+    for row in cores:
+        usage = row["usage"]
+        core_text.append(f"{row['name']}={'NA' if usage is None else f'{usage:.1f}%'}")
+    print("CPU cores: " + " | ".join(core_text))
+    print(f"{'PID':>6} {'CPU%':>6} {'MEM%':>6} {'STAT':<5} COMMAND")
+    for row in tasks:
+        print(f"{row['pid']:>6} {row['cpu']:>6} {row['mem']:>6} {row['stat']:<5} {row['comm']}")
+
+
+def draw_overview_view(
+    stdscr: curses.window,
+    items: list[str],
+    selected: int,
+    history: dict[str, deque[float | None]],
+    labels: dict[str, str],
+    tasks: list[dict[str, str]],
+    cores: list[dict[str, object]],
+    fan: dict[str, object] | None,
+) -> None:
     stdscr.erase()
     rows, cols = stdscr.getmaxyx()
-    left_w = min(44, max(32, cols // 2))
-    right_x = left_w + 1
-    right_w = max(20, cols - right_x - 1)
-
-    stdscr.addnstr(0, 0, f"{time.strftime('%F %T')}  host={os.uname().nodename}", cols - 1, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
-    stdscr.addnstr(1, 0, f"load={loadavg()}  freq={cpu_freq_summary()}", cols - 1, curses.color_pair(WHITE_PAIR))
-    stdscr.addnstr(2, 0, "q quit | Up/Down choose item | right panel shows selected waveform", cols - 1, curses.color_pair(WHITE_PAIR))
-    stdscr.addnstr(3, 0, f"network: {summary_line(labels, 'net:')}  usb: {labels.get('usb:devices', 'none')}", cols - 1, curses.color_pair(WHITE_PAIR))
-
-    if rows < 12 or cols < 70:
-        stdscr.addnstr(5, 0, "terminal too small; enlarge it for waveform view", cols - 1, curses.color_pair(YELLOW_PAIR))
+    draw_status_line(stdscr, "overview", labels, cols)
+    if rows < 16 or cols < 88:
+        stdscr.addnstr(5, 2, "terminal too small; enlarge it for the split dashboard", cols - 4, curses.color_pair(YELLOW_PAIR))
         stdscr.refresh()
         return
 
-    stdscr.addnstr(5, 0, f"{'ITEM':<26} {'NOW':>12}", left_w - 1, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
-    visible_h = rows - 7
+    pane_y = 5
+    pane_h = rows - 7
+    left_w = min(45, max(34, cols // 2))
+    right_x = left_w + 1
+    right_w = max(24, cols - right_x - 2)
+    draw_box(stdscr, pane_y, 1, pane_h, left_w - 1, "Telemetry")
+    draw_box(stdscr, pane_y, right_x, pane_h, right_w, "Detail")
+
+    visible_h = pane_h - 2
     start = max(0, min(selected - visible_h // 2, max(len(items) - visible_h, 0)))
-    for screen_row, idx in enumerate(range(start, min(start + visible_h, len(items))), start=6):
+    stdscr.addnstr(pane_y + 1, 3, f"{'ITEM':<24} {'NOW':>11}", left_w - 5, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
+    for screen_row, idx in enumerate(range(start, min(start + visible_h, len(items))), start=pane_y + 2):
         key = items[idx]
         value = history[key][-1] if history.get(key) else None
-        label_pair = WHITE_PAIR if idx % 2 == 0 else GREEN_PAIR
-        value_pair = color_pair_for(key, value)
-        attr = curses.color_pair(label_pair)
+        attr = curses.color_pair(WHITE_PAIR if idx % 2 == 0 else GREEN_PAIR)
         if idx == selected:
-            attr |= curses.A_REVERSE
-        marker = ">" if idx == selected else " "
-        stdscr.addnstr(screen_row, 0, f"{marker} {labels.get(key, key):<25.25}", 28, attr)
-        stdscr.addnstr(screen_row, 29, f"{value_text(key, value):>12}", 12, curses.color_pair(value_pair) | (curses.A_REVERSE if idx == selected else 0))
-
-    for y in range(5, rows):
-        stdscr.addch(y, left_w, curses.ACS_VLINE, curses.color_pair(WHITE_PAIR))
+            attr |= curses.A_REVERSE | curses.A_BOLD
+        stdscr.addnstr(screen_row, 3, f"{clip(labels.get(key, key), 24):<24}", 24, attr)
+        stdscr.addnstr(screen_row, 28, f"{value_text(key, value):>11}", 11, curses.color_pair(color_pair_for(key, value)) | (curses.A_REVERSE if idx == selected else 0))
 
     selected_key = items[selected]
     selected_value = history[selected_key][-1] if history.get(selected_key) else None
-    wave_h = max(6, rows - 11)
-    wave_w = max(12, right_w - 15)
-    wave, scale = area_chart(selected_key, history[selected_key], wave_w, wave_h)
-    pair = color_pair_for(selected_key, selected_value)
     now_value, avg_value, max_value = history_stats(history[selected_key])
-    title = (
-        f"{labels.get(selected_key, selected_key)}  "
-        f"now={value_text(selected_key, now_value)}  "
-        f"avg={value_text(selected_key, avg_value)}  "
-        f"max={value_text(selected_key, max_value)}"
-    )
-    stdscr.addnstr(5, right_x, title, right_w, curses.color_pair(pair) | curses.A_BOLD)
-    warn, crit = chart_thresholds(selected_key)
-    threshold_text = ""
-    if warn is not None and crit is not None:
-        threshold_text = f" range={scale}  '-' warn {warn:.0f}  '=' critical {crit:.0f}"
-    else:
-        threshold_text = f" range={scale}"
-    stdscr.addnstr(6, right_x, "older".ljust(max(0, wave_w - 3)) + "now" + threshold_text, right_w, curses.color_pair(WHITE_PAIR))
+    pair = color_pair_for(selected_key, selected_value)
+    inner_x = right_x + 1
+    inner_y = pane_y + 1
+    inner_w = right_w - 2
+    inner_h = pane_h - 2
+    stdscr.addnstr(inner_y, inner_x, clip(f"{labels.get(selected_key, selected_key)}", inner_w), inner_w, curses.color_pair(pair) | curses.A_BOLD)
+    stdscr.addnstr(inner_y + 1, inner_x, clip(f"now {value_text(selected_key, now_value)}  avg {value_text(selected_key, avg_value)}  max {value_text(selected_key, max_value)}", inner_w), inner_w, curses.color_pair(WHITE_PAIR))
 
-    vals = [v for v in history[selected_key] if v is not None]
-    lo, hi = axis_range(selected_key, vals)
-    mid = lo + (hi - lo) / 2.0
-    ylabels = {0: hi, wave_h // 2: mid, wave_h - 1: lo}
-    for i, line in enumerate(wave):
-        y = 7 + i
-        if y >= rows:
-            break
-        ylab = f"{ylabels[i]:>7.1f} " if i in ylabels else " " * 8
-        stdscr.addnstr(y, right_x, ylab, 8, curses.color_pair(WHITE_PAIR))
-        stdscr.addnstr(y, right_x + 8, line, wave_w, curses.color_pair(pair))
+    if selected_key == "cpu":
+        core_pairs = [row for row in cores if row["usage"] is not None]
+        stdscr.addnstr(inner_y + 3, inner_x, "CPU cores", inner_w, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
+        for i, row in enumerate(core_pairs[: max(0, inner_h - 10)]):
+            pct = row["usage"]
+            bar_w = max(8, inner_w - 12)
+            filled = int(round((pct or 0.0) * bar_w / 100.0))
+            bar = "#" * filled + "." * max(0, bar_w - filled)
+            stdscr.addnstr(inner_y + 4 + i, inner_x, f"{row['name']:<4} [{bar}] {pct:5.1f}%", inner_w, curses.color_pair(GREEN_PAIR if (pct or 0) < 70 else YELLOW_PAIR if (pct or 0) < 90 else RED_PAIR))
+        task_start = inner_y + 4 + min(len(core_pairs), max(0, inner_h - 10))
+        stdscr.addnstr(task_start, inner_x, "Top tasks", inner_w, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
+        for i, row in enumerate(tasks[: max(0, inner_h - (task_start - inner_y) - 2)], start=1):
+            stdscr.addnstr(task_start + i, inner_x, clip(f"{row['pid']:>6} {row['cpu']:>5}% {row['comm']}", inner_w), inner_w, curses.color_pair(WHITE_PAIR))
+    elif selected_key == "fan:speed" and fan:
+        mode = fan.get("mode", "pwm")
+        stdscr.addnstr(inner_y + 3, inner_x, f"mode {mode}", inner_w, curses.color_pair(WHITE_PAIR))
+        stdscr.addnstr(inner_y + 4, inner_x, f"speed {fan.get('label_value', 'NA')}  pwm {fan.get('pwm_raw', 'NA')}  enable {fan.get('enable', 'NA')}", inner_w, curses.color_pair(WHITE_PAIR))
+        stdscr.addnstr(inner_y + 6, inner_x, "trend", inner_w, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
+        wave_h = max(4, inner_h - 8)
+        wave_w = max(8, inner_w - 10)
+        wave, scale = area_chart(selected_key, history[selected_key], wave_w, wave_h)
+        stdscr.addnstr(inner_y + 7, inner_x, f"range {scale}", inner_w, curses.color_pair(WHITE_PAIR))
+        for i, line in enumerate(wave[: wave_h]):
+            stdscr.addnstr(inner_y + 8 + i, inner_x, clip(line, inner_w), inner_w, curses.color_pair(pair))
+    else:
+        warn, crit = chart_thresholds(selected_key)
+        wave_h = max(4, inner_h - 6)
+        wave_w = max(8, inner_w - 10)
+        wave, scale = area_chart(selected_key, history[selected_key], wave_w, wave_h)
+        stdscr.addnstr(inner_y + 3, inner_x, f"range {scale}", inner_w, curses.color_pair(WHITE_PAIR))
+        if warn is not None and crit is not None:
+            stdscr.addnstr(inner_y + 4, inner_x, f"warn {warn:.0f}  critical {crit:.0f}", inner_w, curses.color_pair(WHITE_PAIR))
+        for i, line in enumerate(wave[: wave_h]):
+            stdscr.addnstr(inner_y + 5 + i, inner_x, clip(line, inner_w), inner_w, curses.color_pair(pair))
+
+    stdscr.refresh()
+
+
+def draw_task_view(
+    stdscr: curses.window,
+    tasks: list[dict[str, str]],
+    selected: int,
+    cores: list[dict[str, object]],
+    labels: dict[str, str],
+) -> None:
+    stdscr.erase()
+    rows, cols = stdscr.getmaxyx()
+    draw_status_line(stdscr, "tasks", labels, cols)
+    if rows < 16 or cols < 88:
+        stdscr.addnstr(5, 2, "terminal too small; enlarge it for the task dashboard", cols - 4, curses.color_pair(YELLOW_PAIR))
+        stdscr.refresh()
+        return
+
+    pane_y = 5
+    pane_h = rows - 7
+    left_w = min(52, max(40, cols // 2 + 4))
+    right_x = left_w + 1
+    right_w = max(24, cols - right_x - 2)
+    draw_box(stdscr, pane_y, 1, pane_h, left_w - 1, "Tasks")
+    draw_box(stdscr, pane_y, right_x, pane_h, right_w, "CPU Detail")
+
+    visible_h = pane_h - 2
+    selected = max(0, min(selected, max(len(tasks) - 1, 0)))
+    stdscr.addnstr(pane_y + 1, 3, f"{'PID':>6} {'CPU%':>6} {'MEM%':>6} {'PSR':>4} {'CMD':<20}", left_w - 5, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
+    start = max(0, min(selected - visible_h // 2, max(len(tasks) - visible_h, 0)))
+    for screen_row, idx in enumerate(range(start, min(start + visible_h, len(tasks))), start=pane_y + 2):
+        row = tasks[idx]
+        attr = curses.color_pair(WHITE_PAIR if idx % 2 == 0 else GREEN_PAIR)
+        if idx == selected:
+            attr |= curses.A_REVERSE | curses.A_BOLD
+        stdscr.addnstr(screen_row, 3, f"{row['pid']:>6} {row['cpu']:>6} {row['mem']:>6} {row['psr']:>4} {clip(row['comm'], 20):<20}", left_w - 5, attr)
+
+    selected_row = tasks[selected] if tasks else None
+    if not selected_row:
+        stdscr.refresh()
+        return
+
+    detail = task_detail(selected_row["pid"])
+    inner_x = right_x + 1
+    inner_y = pane_y + 1
+    inner_w = right_w - 2
+    inner_h = pane_h - 2
+    title = clip(f"{selected_row['pid']} {selected_row['comm']}", inner_w)
+    stdscr.addnstr(inner_y, inner_x, title, inner_w, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
+    base_line = detail or selected_row
+    stdscr.addnstr(inner_y + 1, inner_x, clip(f"cpu {base_line.get('cpu', selected_row['cpu'])}%  mem {base_line.get('mem', selected_row['mem'])}%  rss {base_line.get('rss', selected_row['rss'])} KiB", inner_w), inner_w, curses.color_pair(WHITE_PAIR))
+    stdscr.addnstr(inner_y + 2, inner_x, clip(f"pid {base_line.get('pid', selected_row['pid'])}  ppid {base_line.get('ppid', selected_row['ppid'])}  psr {base_line.get('psr', selected_row['psr'])}  pri {base_line.get('pri', 'NA')}  ni {base_line.get('ni', 'NA')}  stat {base_line.get('stat', selected_row['stat'])}", inner_w), inner_w, curses.color_pair(WHITE_PAIR))
+
+    stdscr.addnstr(inner_y + 4, inner_x, "Per-core load", inner_w, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
+    core_rows = [row for row in cores if row["usage"] is not None]
+    for i, row in enumerate(core_rows[: max(0, inner_h - 10)]):
+        pct = float(row["usage"] or 0.0)
+        bar_w = max(8, inner_w - 12)
+        filled = int(round(pct * bar_w / 100.0))
+        bar = "#" * filled + "." * max(0, bar_w - filled)
+        pair = GREEN_PAIR if pct < 70 else YELLOW_PAIR if pct < 90 else RED_PAIR
+        stdscr.addnstr(inner_y + 5 + i, inner_x, f"{row['name']:<4} [{bar}] {pct:5.1f}%", inner_w, curses.color_pair(pair))
+
+    summary_y = inner_y + 5 + min(len(core_rows), max(0, inner_h - 10))
+    stdscr.addnstr(summary_y, inner_x, "Command", inner_w, curses.color_pair(WHITE_PAIR) | curses.A_BOLD)
+    stdscr.addnstr(summary_y + 1, inner_x, clip(base_line.get("args", selected_row["comm"]), inner_w), inner_w, curses.color_pair(WHITE_PAIR))
     stdscr.refresh()
 
 
@@ -839,10 +1062,15 @@ def run_curses(args: argparse.Namespace) -> int:
     labels: dict[str, str] = {"cpu": "cpu usage", "memory": "memory used", "disk:/": "disk / used"}
     prev_cpu = cpu_times()
     prev_net = net_counters()
+    prev_core = cpu_core_times()
     last_sample = time.time()
+    view = "tasks" if args.task_view else "overview"
     time.sleep(min(args.interval, 0.25))
     now = time.time()
     points, prev_cpu, prev_net = collect_points(prev_cpu, prev_net, now - last_sample, labels)
+    core_rows, prev_core = cpu_core_usage(prev_core)
+    tasks = task_rows(args.task_limit)
+    fan = fan_status()
     last_sample = now
     items = [key for key, _ in points]
     history: dict[str, deque[float | None]] = {key: deque(maxlen=args.history) for key in items}
@@ -850,13 +1078,16 @@ def run_curses(args: argparse.Namespace) -> int:
         history[key].append(value)
 
     if args.once or not sys.stdin.isatty() or not sys.stdout.isatty():
-        draw_text_once(items, history, labels)
+        if view == "tasks":
+            draw_task_once(tasks, core_rows, labels)
+        else:
+            draw_overview_once(items, history, labels)
         return 0
 
     selected = 0
 
     def loop(stdscr: curses.window) -> None:
-        nonlocal selected, prev_cpu, prev_net, last_sample, items, history
+        nonlocal selected, prev_cpu, prev_net, prev_core, last_sample, items, history, view, tasks, core_rows, fan
         curses.curs_set(0)
         curses.use_default_colors()
         curses.init_pair(WHITE_PAIR, curses.COLOR_WHITE, -1)
@@ -871,6 +1102,9 @@ def run_curses(args: argparse.Namespace) -> int:
             now = time.time()
             if now >= next_update:
                 points, prev_cpu, prev_net = collect_points(prev_cpu, prev_net, now - last_sample, labels)
+                core_rows, prev_core = cpu_core_usage(prev_core)
+                tasks = task_rows(args.task_limit)
+                fan = fan_status()
                 last_sample = now
                 new_items = [key for key, _ in points]
                 for key in new_items:
@@ -879,18 +1113,41 @@ def run_curses(args: argparse.Namespace) -> int:
                     history[key].append(value)
                 items = new_items
                 selected = max(0, min(selected, len(items) - 1))
-                draw_dashboard(stdscr, items, selected, history, labels)
+                if view == "tasks":
+                    selected = max(0, min(selected, len(tasks) - 1))
+                    draw_task_view(stdscr, tasks, selected, core_rows, labels)
+                else:
+                    draw_overview_view(stdscr, items, selected, history, labels, tasks, core_rows, fan)
                 next_update = now + args.interval
 
             key = stdscr.getch()
             if key in (ord("q"), ord("Q")):
                 return
+            if key in (ord("t"), ord("T")):
+                view = "tasks" if view == "overview" else "overview"
+                selected = 0
+                next_update = 0.0
+                if view == "tasks":
+                    draw_task_view(stdscr, tasks, selected, core_rows, labels)
+                else:
+                    draw_overview_view(stdscr, items, selected, history, labels, tasks, core_rows, fan)
+                continue
             if key in (curses.KEY_UP, ord("k"), ord("K")):
-                selected = max(0, selected - 1)
-                draw_dashboard(stdscr, items, selected, history, labels)
+                if view == "tasks":
+                    selected = max(0, selected - 1)
+                    draw_task_view(stdscr, tasks, selected, core_rows, labels)
+                else:
+                    selected = max(0, selected - 1)
+                    draw_overview_view(stdscr, items, selected, history, labels, tasks, core_rows, fan)
             elif key in (curses.KEY_DOWN, ord("j"), ord("J")):
-                selected = min(len(items) - 1, selected + 1)
-                draw_dashboard(stdscr, items, selected, history, labels)
+                if view == "tasks":
+                    selected = min(len(tasks) - 1, selected + 1)
+                    draw_task_view(stdscr, tasks, selected, core_rows, labels)
+                else:
+                    selected = min(len(items) - 1, selected + 1)
+                    draw_overview_view(stdscr, items, selected, history, labels, tasks, core_rows, fan)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                next_update = 0.0
             time.sleep(0.03)
 
     curses.wrapper(loop)
@@ -901,6 +1158,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Live TaishanPi board telemetry dashboard.")
     parser.add_argument("--interval", type=float, default=1.0, help="poll interval in seconds")
     parser.add_argument("--history", type=int, default=120, help="history points per item")
+    parser.add_argument("--task-limit", type=int, default=12, help="number of tasks to show in the task view")
+    parser.add_argument("--task-view", action="store_true", help="start in the task view")
     parser.add_argument("--once", action="store_true", help="print one live-style snapshot and exit")
     args = parser.parse_args()
     return run_curses(args)
